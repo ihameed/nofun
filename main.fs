@@ -1,6 +1,6 @@
 #light "off"
 (*
-Copyright (c) 2015, Imran Hameed
+Copyright (c) 2015-2017, Imran Hameed
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -105,9 +105,7 @@ type shell_controls = {
   notifications : ctl option;
 }
 
-let mutable controls = { feedback = None; sign_in = None; notifications = None }
-
-let alter_controls (cfg : settings) =
+let alter_controls (controls : shell_controls) (cfg : settings) =
   let alter e (c : ctl option) = match c with
     | Some c -> c.Width <- if e then nan else 0.
     | None -> () in
@@ -115,32 +113,34 @@ let alter_controls (cfg : settings) =
   alter cfg.sign_in controls.sign_in;
   alter cfg.notifications controls.notifications
 
+let mutable controls = { feedback = None; sign_in = None; notifications = None }
+
 let init_controls (cfg : settings) =
   let matches = new ((_, _) Dictionary) () in
   let add x y = ignore (matches.Add (y, x)) in
   let lookup_remove (x : ctl) =
     let k = x.GetType().FullName in
     let mutable v = Unchecked.defaultof<_> in
-    if matches.TryGetValue (k, &v) then (matches.Remove k; Some v) else None in
+    if matches.TryGetValue (k, &v) then (ignore (matches.Remove k); Some v) else None in
   let is_empty () = matches.Count = 0 in
 
-  let mutable c = { feedback = None; sign_in = None; notifications = None } in
-  let finish () = controls <- c; alter_controls cfg in
   add
-    (fun x -> c <- { c with feedback = x })
+    (fun x -> controls <- { controls with feedback = x })
     "Microsoft.VisualStudio.Feedback.SendASmileButton";
   add
-    (fun x -> c <- { c with sign_in = x })
+    (fun x -> controls <- { controls with sign_in = x })
     "Microsoft.VisualStudio.Shell.Connected.UserInformation.UserInformationCard";
   add
-    (fun x -> c <- { c with notifications = x })
+    (fun x -> controls <- { controls with notifications = x })
     "Microsoft.VisualStudio.Services.UserNotifications.UserNotificationsBadge";
 
   let wnd = Application.Current.MainWindow in
   let walk_tree () = for x in wnd.FindDescendants<ctl> () do
-    match lookup_remove x with
+    begin match lookup_remove x with
     | Some save -> save (Some x)
     | None -> ()
+    end;
+    alter_controls controls cfg
   done in
 
   let mutable attempt = 0 in
@@ -149,15 +149,11 @@ let init_controls (cfg : settings) =
     let rec layout_updated = System.EventHandler (fun _ _ ->
       walk_tree ();
       attempt <- attempt + 1;
-      if is_empty () || attempt > 400 then begin
-        evt.RemoveHandler layout_updated;
-        finish ()
-      end) in
+      if is_empty () || attempt > 400 then evt.RemoveHandler layout_updated) in
     evt.AddHandler layout_updated in
 
   walk_tree ();
   if not (is_empty ()) then poll_until_done ()
-  else finish ()
 
 let failed x = x <> VSConstants.S_OK
 
@@ -421,7 +417,7 @@ nofun_package () = class
         Seq.filter (fun x -> x.Roles.Contains PredefinedTextViewRoles.Document) |>
         Seq.filter (fun x -> x.TextDataModel.ContentType.IsOfType "text") |>
         Seq.iter (alter_text_view cfg mk);
-      alter_controls cfg in
+      alter_controls controls cfg in
 
     settings_changed <- (fun cfg' -> if cfg <> cfg' then
       cfg <- cfg';
