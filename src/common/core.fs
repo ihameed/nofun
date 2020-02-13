@@ -1,6 +1,6 @@
 #light "off"
 (*
-Copyright (c) 2015-2017, Imran Hameed
+Copyright (c) 2015-2020, Imran Hameed
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -24,7 +24,7 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 *)
-module Nofun
+module NofunCore
 
 open Microsoft.VisualStudio
 open Microsoft.VisualStudio.ComponentModelHost
@@ -37,16 +37,24 @@ open System.Collections.Generic
 open System.ComponentModel.Composition
 open System.Windows
 
-let log fmt = Printf.ksprintf System.Diagnostics.Trace.WriteLine fmt
+open Microsoft.Internal.VisualStudio.Shell.Interop
+
+open System.Runtime.InteropServices
+[<DllImport("kernel32.dll")>]
+extern void OutputDebugString(string lpOutputString);
+
+//let log fmt = Printf.ksprintf System.Diagnostics.Trace.WriteLine fmt
+let log fmt = Printf.ksprintf OutputDebugString fmt
 
 let ppr fmt = Printf.ksprintf id fmt
 
 type eol = Lf | CrLf | Cr
 
 type settings = {
+  zoom_control : bool option;
   wheel_zoom : bool option;
   suggestion : bool option;
-  outlining : bool option;
+  outlining_margin : bool option;
   eol : eol option;
   keep_eol : bool option;
   feedback : bool;
@@ -91,14 +99,15 @@ let alter_text_view cfg mk (view : IWpfTextView) =
   in
   let alter = alter' edopts id in
   alter cfg.suggestion suggestion_margin_id;
-  alter cfg.outlining DefaultTextViewHostOptions.OutliningMarginId;
+  alter cfg.outlining_margin DefaultTextViewHostOptions.OutliningMarginId;
+  alter cfg.zoom_control DefaultTextViewHostOptions.ZoomControlId;
   let alter = alter' nfopts id in
   alter cfg.wheel_zoom DefaultWpfViewOptions.EnableMouseWheelZoomId;
   alter cfg.keep_eol DefaultOptions.ReplicateNewLineCharacterOptionId;
   let alter = alter' nfopts code_of_eol in
   alter cfg.eol DefaultOptions.NewLineCharacterOptionId;
 
-type ctl = System.Windows.Controls.Control
+type ctl = System.Windows.FrameworkElement
 type shell_controls = {
   feedback : ctl option;
   sign_in : ctl option;
@@ -107,7 +116,9 @@ type shell_controls = {
 
 let alter_controls (controls : shell_controls) (cfg : settings) =
   let alter e (c : ctl option) = match c with
-    | Some c -> c.Width <- if e then nan else 0.
+    | Some c ->
+      c.Width <- if e then nan else 0.;
+      c.Height <- if e then nan else 0.
     | None -> () in
   alter cfg.feedback controls.feedback;
   alter cfg.sign_in controls.sign_in;
@@ -121,8 +132,11 @@ let init_controls (cfg : settings) =
   let lookup_remove (x : ctl) =
     let k = x.GetType().FullName in
     let mutable v = Unchecked.defaultof<_> in
-    if matches.TryGetValue (k, &v) then (ignore (matches.Remove k); Some v) else None in
+    //(if k.ToLower().Contains "draggable" then (log "possibly related: %A" k) else ());
+    if matches.TryGetValue (k, &v) then (ignore (matches.Remove k); Some v) else None
+  in
   let is_empty () = matches.Count = 0 in
+  let dte = Package.GetGlobalService (typeof<EnvDTE.DTE>) :?> EnvDTE.DTE in
 
   add
     (fun x -> controls <- { controls with feedback = x })
@@ -130,9 +144,20 @@ let init_controls (cfg : settings) =
   add
     (fun x -> controls <- { controls with sign_in = x })
     "Microsoft.VisualStudio.Shell.Connected.UserInformation.UserInformationCard";
-  add
-    (fun x -> controls <- { controls with notifications = x })
-    "Microsoft.VisualStudio.Services.UserNotifications.UserNotificationsBadge";
+
+  // log "layout updated version = %A" dte.Version;
+  (if dte.Version.StartsWith "16."
+  then (
+    // log "adding Microsoft.VisualStudio.PlatformUI.DraggableDockPanel";
+    add
+      (fun x -> controls <- { controls with notifications = x })
+      "Microsoft.VisualStudio.PlatformUI.DraggableDockPanel"
+  ) else (
+    // log "Microsoft.VisualStudio.Services.UserNotifications.UserNotificationsBadge";
+    add
+      (fun x -> controls <- { controls with notifications = x })
+      "Microsoft.VisualStudio.Services.UserNotifications.UserNotificationsBadge"
+  ) );
 
   let wnd = Application.Current.MainWindow in
   let walk_tree () = for x in wnd.FindDescendants<ctl> () do
@@ -147,9 +172,12 @@ let init_controls (cfg : settings) =
   let poll_until_done () =
     let evt = wnd.LayoutUpdated in
     let rec layout_updated = System.EventHandler (fun _ _ ->
+      // log "layout updated";
       walk_tree ();
       attempt <- attempt + 1;
-      if is_empty () || attempt > 400 then evt.RemoveHandler layout_updated) in
+      let should_stop = is_empty () || attempt > 400 in
+      let should_stop = is_empty () in
+      if should_stop then evt.RemoveHandler layout_updated) in
     evt.AddHandler layout_updated in
 
   walk_tree ();
@@ -240,9 +268,9 @@ let bool_of_str s = match s with "True" -> Some true | "False" -> Some false | _
 let with_default def opt = match opt with Some v -> v | None -> def
 
 let mutable cfg = {
-  wheel_zoom = None; suggestion = None; outlining = None;
+  zoom_control = None; wheel_zoom = None; suggestion = None; outlining_margin = None;
   eol = None; keep_eol = None;
-  feedback = true; sign_in = true; notifications = true }
+  feedback = false; sign_in = false; notifications = false }
 
 type OptionM () = class
   member inline x.Bind (v, f) = match v with Some v -> f v | None -> None
@@ -261,9 +289,57 @@ type parse = interface
   abstract f : string -> (string -> 'a option) -> 'a -> 'a
 end
 
+let parse_settings (f : parse) = let f = f.f in
+  {
+    zoom_control = f "enable_zoom_control" (val_of bool_assoc) None;
+    wheel_zoom = f "enable_mouse_wheel_zoom" (val_of bool_assoc) None;
+    suggestion = f "show_suggestion_margin" (val_of bool_assoc) None;
+    outlining_margin = f "show_outlining_margin" (val_of bool_assoc) None;
+    eol = f "line_endings" (val_of eol_assoc) None;
+    keep_eol = f "preserve_line_endings" (val_of bool_assoc) None;
+    feedback = f "show_feedback_button" bool_of_str true;
+    sign_in = f "show_sign_in_button" bool_of_str true;
+    notifications = f "show_notifications_button" bool_of_str true;
+  }
+
+let print_settings f (settings : settings) =
+    f "enable_zoom_control" (str_of bool_assoc settings.zoom_control);
+    f "enable_mouse_wheel_zoom" (str_of bool_assoc settings.wheel_zoom);
+    f "show_suggestion_margin" (str_of bool_assoc settings.suggestion);
+    f "show_outlining_margin" (str_of bool_assoc settings.outlining_margin);
+    f "line_endings" (str_of eol_assoc settings.eol);
+    f "preserve_line_endings" (str_of bool_assoc settings.keep_eol);
+    f "show_feedback_button" (str_of_bool settings.feedback);
+    f "show_sign_in_button" (str_of_bool settings.sign_in);
+    f "show_notifications_button" (str_of_bool settings.notifications)
+
+let registry_path = "DialogPage\Nofun+settings_page"
+
+let load_settings_from_registry (root : Microsoft.Win32.RegistryKey) =
+  let sub = root.OpenSubKey registry_path in
+  if sub <> null then begin
+    use sub = sub in
+    let get name parse def = with_default def <| opt {
+      let! v = null_to_none (sub.GetValue name) in
+      let! v = match v with :? string as v -> Some v | _ -> None in
+      let! v = parse v in
+      return v
+      } in
+    parse_settings { new parse with member __.f x y z = get x y z }
+  end
+  else begin
+    parse_settings { new parse with member __.f _ _ def = def }
+  end
+
+let save_settings_to_registry (root : Microsoft.Win32.RegistryKey) (settings : settings) =
+  let sub = root.OpenSubKey (registry_path, true) in
+  use sub = if sub <> null then sub else root.CreateSubKey registry_path in
+  let set name v = sub.SetValue (name, v) in
+  print_settings set settings
+
 [<Guid "2880a7df-1a69-4e26-8743-b9f2a9572cd2">]
 [<Sealed>]
-type settings_page () = class
+type settings_page<'a> () = class
   inherit DialogPage ()
 
   [<DisplayName "Enable Mouse Wheel Zoom">]
@@ -271,6 +347,12 @@ type settings_page () = class
   [<Category "Editor">]
   [<TypeConverter (typeof<bool_conv>)>]
   member val enable_mouse_wheel_zoom = None with get, set
+
+  [<DisplayName "Enable Zoom Control">]
+  [<Description "Enables or disables the zoom control in text views.">]
+  [<Category "Editor">]
+  [<TypeConverter (typeof<bool_conv>)>]
+  member val enable_zoom_control = None with get, set
 
   [<DisplayName "Show Suggestion Margin">]
   [<Description "Shows or hides the suggestion margin.">]
@@ -311,10 +393,16 @@ type settings_page () = class
   [<Category "Shell">]
   member val show_notifications_button = true with get, set
 
-  member x.settings () = {
+  member x.settings () =
+    let package = x.GetService (typeof<'a>) :?> Package in
+    let path = x.SettingsRegistryPath in
+    use root = package.UserRegistryRoot in
+    // log "root = %A, path = %A" root path;
+  {
+    zoom_control = x.enable_zoom_control;
     wheel_zoom = x.enable_mouse_wheel_zoom;
     suggestion = x.show_suggestion_margin;
-    outlining = x.show_outlining_margin;
+    outlining_margin = x.show_outlining_margin;
     feedback = x.show_feedback_button;
     eol = x.line_endings;
     keep_eol = x.preserve_line_endings;
@@ -322,11 +410,23 @@ type settings_page () = class
     notifications = x.show_notifications_button;
   }
 
+  member x.from_settings (cfg : settings) =
+    x.enable_zoom_control <- cfg.zoom_control;
+    x.enable_mouse_wheel_zoom <- cfg.wheel_zoom;
+    x.show_suggestion_margin <- cfg.suggestion;
+    x.show_outlining_margin <- cfg.outlining_margin;
+    x.line_endings <- cfg.eol;
+    x.preserve_line_endings <- cfg.keep_eol;
+    x.show_feedback_button <- cfg.feedback;
+    x.show_sign_in_button <- cfg.sign_in;
+    x.show_notifications_button <- cfg.notifications;
+
   member x.changed () =
     let cfg = x.settings () in
     settings_changed cfg
 
   member x.print f =
+    f "enable_zoom_control" (str_of bool_assoc x.enable_zoom_control);
     f "enable_mouse_wheel_zoom" (str_of bool_assoc x.enable_mouse_wheel_zoom);
     f "show_suggestion_margin" (str_of bool_assoc x.show_suggestion_margin);
     f "show_outlining_margin" (str_of bool_assoc x.show_outlining_margin);
@@ -336,51 +436,27 @@ type settings_page () = class
     f "show_sign_in_button" (str_of_bool x.show_sign_in_button);
     f "show_notifications_button" (str_of_bool x.show_notifications_button);
 
-  member x.parse (f : parse) = let f = f.f in
-    x.enable_mouse_wheel_zoom <- f "enable_mouse_wheel_zoom" (val_of bool_assoc) None;
-    x.show_suggestion_margin <- f "show_suggestion_margin" (val_of bool_assoc) None;
-    x.show_outlining_margin <- f "show_outlining_margin" (val_of bool_assoc) None;
-    x.line_endings <- f "line_endings" (val_of eol_assoc) None;
-    x.preserve_line_endings <- f "preserve_line_endings" (val_of bool_assoc) None;
-    x.show_feedback_button <- f "show_feedback_button" bool_of_str true;
-    x.show_sign_in_button <- f "show_sign_in_button" bool_of_str true;
-    x.show_notifications_button <- f "show_notifications_button" bool_of_str true;
-
   override x.OnApply y = base.OnApply y; x.changed ()
 
   override x.SaveSettingsToStorage () =
-    let package = x.GetService (typeof<nofun_package>) :?> nofun_package in
-    let path = x.SettingsRegistryPath in
+    let package = x.GetService (typeof<'a>) :?> Package in
     use root = package.UserRegistryRoot in
-    // log "root = %A" root;
-    let sub = root.OpenSubKey (path, true) in
-    use sub = if sub <> null then sub else root.CreateSubKey path in
-    let set name v = sub.SetValue (name, v) in
-    x.print set
+    let settings = x.settings () in
+    save_settings_to_registry root settings
 
   override x.LoadSettingsFromStorage () =
-    let package = x.GetService (typeof<nofun_package>) :?> nofun_package in
-    let path = x.SettingsRegistryPath in
+    let package = x.GetService (typeof<'a>) :?> Package in
     use root = package.UserRegistryRoot in
-    let sub = root.OpenSubKey path in
-    if sub <> null then begin
-      use sub = sub in
-      let get name parse def = with_default def <| opt {
-        let! v = null_to_none (sub.GetValue name) in
-        let! v = match v with :? string as v -> Some v | _ -> None in
-        let! v = parse v in
-        return v
-        } in
-      x.parse { new parse with member __.f x y z = get x y z };
-      x.changed ()
-    end;
+    let cfg = load_settings_from_registry root in
+    x.from_settings cfg;
+    x.changed ()
 
   override x.SaveSettingsToXml xml =
     let set name v = ignore (xml.WriteSettingString (name, v)) in
     x.print set
 
   override x.LoadSettingsFromXml xml =
-    let read_str name = 
+    let read_str name =
       let mutable str = Unchecked.defaultof<_> in
       if not (failed (xml.ReadSettingString (name, &str)))
       then Some str else None in
@@ -389,43 +465,9 @@ type settings_page () = class
       let! v = parse v in
       return v
       } in
-    x.parse { new parse with member __.f x y z = get x y z };
+    let cfg = parse_settings { new parse with member __.f x y z = get x y z } in
+    x.from_settings cfg;
     x.changed ()
-end and
-[<PackageRegistration (UseManagedResourcesOnly = true)>]
-[<InstalledProductRegistration ("#110", "#112", "1.0.0.0", IconResourceID = 400)>]
-[<Guid ("e1f5e968-3b43-45e3-9c49-24220d9ff002")>]
-[<ProvideOptionPage (typeof<settings_page>, "Nofun", "General", 1s, 2s, false)>]
-[<ProvideProfile (typeof<settings_page>, "Nofun", "General", 1s, 3s, false)>]
-[<ProvideAutoLoad (UiContext.NoSolution_string)>]
-[<ProvideAutoLoad (UiContext.SolutionOpening_string)>]
-[<ProvideAutoLoad (UiContext.SolutionExists_string)>]
-[<Sealed>]
-nofun_package () = class
-  inherit Package ()
-  override x.Initialize () =
-    base.Initialize ();
-
-    let mef = x.GetService typeof<SComponentModel> :?> IComponentModel in
-    let shell = x.GetService typeof<SVsUIShell> :?> IVsUIShell in
-    let cvt = mef.GetService<IVsEditorAdaptersFactoryService> () in
-    let mk = mef.GetService<IEditorOptionsFactoryService> () in
-    let reconfigure () =
-      document_frames shell |>
-        Seq.choose (null_to_none << VsShellUtilities.GetTextView) |>
-        Seq.choose (null_to_none << cvt.GetWpfTextView) |>
-        Seq.filter (fun x -> x.Roles.Contains PredefinedTextViewRoles.Document) |>
-        Seq.filter (fun x -> x.TextDataModel.ContentType.IsOfType "text") |>
-        Seq.iter (alter_text_view cfg mk);
-      alter_controls controls cfg in
-
-    settings_changed <- (fun cfg' -> if cfg <> cfg' then
-      cfg <- cfg';
-      reconfigure ());
-    let page = x.GetDialogPage(typeof<settings_page>) :?> settings_page in
-    cfg <- page.settings ();
-    reconfigure ();
-    init_controls cfg 
 end
 
 [<Export (typeof<IWpfTextViewCreationListener>)>]
